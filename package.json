@@ -9,7 +9,8 @@
     "lint": "eslint",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "create-agent": "tsx --env-file=.env scripts/create-agent.ts"
   },
   "dependencies": {
     "luxon": "^3.7.2",

@@ -20,10 +20,11 @@ const schema = z.object({
   /** Shared secret the voice platform sends on every tool call. */
   VOICE_TOOL_SECRET: z.string().optional(),
 
-  // ── ElevenLabs ────────────────────────────────────────────────────────
-  ELEVENLABS_API_KEY: z.string().optional(),
-  ELEVENLABS_AGENT_ID: z.string().optional(),
-  ELEVENLABS_WEBHOOK_SECRET: z.string().optional(),
+  // ── Retell ────────────────────────────────────────────────────────────
+  RETELL_API_KEY: z.string().optional(),
+  /** Printed by `pnpm tsx scripts/create-agent.ts`. */
+  RETELL_AGENT_ID: z.string().optional(),
+  RETELL_BASE_URL: z.string().default("https://api.retellai.com"),
 
   PUBLIC_BASE_URL: z.string().default("http://localhost:3000"),
 })

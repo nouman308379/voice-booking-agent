@@ -55,14 +55,14 @@ when each one comes back.
 | Database | PostgreSQL 16 (Docker Compose locally) |
 | ORM | Drizzle 7 |
 | Validation | Zod 4 — every webhook body and tool argument |
-| Voice | ElevenLabs Agents |
-| Telephony | Twilio (native ElevenLabs integration) |
+| Voice | Retell AI |
+| Telephony | Retell-managed numbers, or a Twilio/SIP number imported into Retell |
 | UI | Tailwind 4 + shadcn/ui |
 | Package manager | pnpm |
 | Tests | Vitest |
 
 **Why Next.js and not a bare Fastify service.** The demo needs three things in one
-deployable: the webhook routes ElevenLabs calls, a page hosting the web voice
+deployable: the webhook routes Retell calls, a page hosting the web voice
 widget, and a dashboard showing appointments landing live. The dashboard is the
 part that actually sells this in a client meeting. Next.js gives all three with
 one `pnpm dev` and one deploy. It also matches the conventions already in use in
@@ -76,7 +76,7 @@ one `pnpm dev` and one deploy. It also matches the conventions already in use in
 
 ```
 ┌───────────────────────────────────────────────────────────────┐
-│  VOICE LAYER            ElevenLabs Agents (config-as-code)    │
+│  VOICE LAYER            Retell AI (config-as-code)            │
 │  Speech in/out, turn-taking, LLM, tool selection.             │
 │  Knows nothing about Postgres or Google.                      │
 └───────────────────────────┬───────────────────────────────────┘
@@ -102,15 +102,17 @@ that enforces this.
 ### Inbound call, end to end
 
 ```
- 1. Caller dials the Twilio number
- 2. Twilio ──► ElevenLabs (native integration, no media server of ours)
- 3. ElevenLabs ──► POST /api/voice/init
-       body: { caller_id, called_number, call_sid, agent_id, conversation_id }
+ 1. Caller dials the number bound to the agent
+ 2. Retell answers (no media server of ours)
+ 3. Retell ──► POST /api/voice/init                    [inbound call webhook]
+       body: { event: "call_inbound",
+               call_inbound: { call_id, agent_id, from_number, to_number } }
     We look up the caller by phone, and reply with dynamic variables:
        today's date, current time, timezone, business hours, appointment
-       length, and the caller's name if we know them.
+       length, and the caller's name if we know them:
+       { call_inbound: { dynamic_variables: { ... } } }
  4. Agent greets. Caller: "I'd like to come in next Tuesday afternoon."
- 5. Agent ──► POST /api/voice/tools?tool=check_availability
+ 5. Agent ──► POST /api/voice/tools?tool=check_availability   [custom function]
        We compute free slots, return a short spoken sentence + signed slot_ids.
  6. Agent offers times. Caller picks one.
  7. Agent ──► POST /api/voice/tools?tool=hold_slot        (5-minute TTL)
@@ -119,14 +121,15 @@ that enforces this.
        SERIALIZABLE tx: consume hold, insert appointment (pending_sync), commit.
        Then, outside the tx: connector.createEvent() ──► status = confirmed.
 10. Agent: "You're all set for Tuesday the 23rd at 2 PM."  Call ends.
-11. ElevenLabs ──► POST /api/voice/post-call
-       HMAC-verified. Store transcript, summary, data collection. Release any
+11. Retell ──► POST /api/voice/post-call         [call_ended, call_analyzed]
+       Signature-verified. Store transcript, summary, analysis. Release any
        hold that was never consumed.
 ```
 
-The web widget takes the same path from step 4 onward. Only step 3 differs: the
-browser has no `caller_id`, so dynamic variables are minted by
-`POST /api/voice/widget-token` instead.
+The web widget takes the same path from step 4 onward. Only step 3 differs:
+there is no inbound call webhook for a web call, so `POST /api/voice/web-call`
+mints the access token and passes `retell_llm_dynamic_variables` at creation
+time.
 
 ---
 
@@ -412,8 +415,10 @@ staleness is acceptable because every booking re-validates inside the
 transaction anyway (§7) — the cache can only cause a slot to be *offered* that
 then fails, never a double-booking.
 
-Configure a filler phrase on the ElevenLabs tool ("Let me check the calendar…")
-so the pause is natural rather than dead air.
+Enable **Talk While Waiting** (`speak_during_execution`) on the custom function
+so the agent says "Let me check the calendar…" instead of leaving dead air.
+Retell's default function timeout is 120s — far too long for a phone call; set
+it near our own budget so a hung dependency ends the turn, not the call.
 
 ---
 
@@ -500,8 +505,8 @@ call actually succeeded and only the response was lost.
 
 ### Idempotency of the tool call itself
 
-ElevenLabs may retry a tool call on a timeout. `book_appointment` is keyed on
-`(conversation_id, slot_id)`: if an appointment already exists for that pair, it
+Retell may retry a custom function on a timeout. `book_appointment` is keyed on
+`(call_id, slot_id)`: if an appointment already exists for that pair, it
 returns the existing booking with the same spoken confirmation rather than
 creating a second one.
 
@@ -597,7 +602,7 @@ enum ConversationChannel { phone  web }
 model Conversation {
   id              String              @id @default(uuid())
   businessId      String
-  externalId      String              @unique  // ElevenLabs conversation_id
+  externalId      String              @unique  // Retell call_id / chat_id
   channel         ConversationChannel
   callerPhone     String?
   callSid         String?
@@ -638,6 +643,21 @@ POST /api/voice/tools?tool=<name>
 Header: X-Voice-Tool-Secret: <VOICE_TOOL_SECRET>
 ```
 
+Each tool is a Retell **custom function** whose URL carries the `?tool=` param
+and whose *custom headers* carry the shared secret. Retell's own request body
+wraps our arguments:
+
+```jsonc
+{ "name": "check_availability",
+  "call": { "call_id": "...", "transcript": "...", "retell_llm_dynamic_variables": {} },
+  "args": { "date_preference": "next Tuesday" } }
+```
+
+so the route reads `args`, and takes `call.call_id` as the conversation key for
+hold ownership and booking idempotency. (Retell's "args only" payload option
+flattens `args` to the top level and drops `call` — don't enable it; we need
+`call_id`.)
+
 `src/services/voice-tools/tool-handlers.ts` holds the dispatch map:
 
 ```ts
@@ -652,6 +672,10 @@ export const TOOL_HANDLERS: Record<string, (args: ToolArgs, ctx: ToolContext) =>
 ```
 
 The route stays thin: authenticate, look up the handler, parse, call, respond.
+
+Retell stringifies whatever we return and hands it to the LLM, so the JSON
+`ToolResponse` below arrives as text the agent reads — which is exactly why
+`result` must already be phrased for speech.
 
 ### Response shape
 
@@ -806,15 +830,20 @@ cancellations), then `connector.deleteEvent`. A 410 from the provider is success
 
 ### Config lives in git
 
-The system prompt, first message, tool definitions, and voice settings live in
-`src/services/agent/prompt/` and are pushed to ElevenLabs by
+The general prompt, begin message, custom functions, and voice settings live in
+`src/services/retell/prompt/` and are pushed to Retell by
 `scripts/sync-agent.ts`. Nobody edits the prompt in the dashboard — it would be
 lost on the next sync and invisible in review.
 
+Retell splits the config across two objects, and the split matters: the
+**Retell LLM** holds the prompt, model, begin message and custom functions; the
+**Agent** holds the voice, language and webhook URL, and points at an LLM by
+`llm_id`. Updating a prompt is a `PATCH` of the LLM, not the agent.
+
 ### Dynamic variables
 
-Injected per conversation by `/api/voice/init` (phone) or
-`/api/voice/widget-token` (web):
+Injected per conversation as `dynamic_variables` in the inbound-call webhook
+response (phone) or as `retell_llm_dynamic_variables` at call creation (web):
 
 | Variable | Example | Why it matters |
 |---|---|---|
@@ -827,8 +856,13 @@ Injected per conversation by `/api/voice/init` (phone) or
 | `{{caller_name}}` | `"Sarah"` or `"there"` | Returning-caller recognition — the single most impressive beat in a demo |
 | `{{is_returning_customer}}` | `"true"` | Branches the greeting |
 
-Note: `system__` prefixed variables are reserved by ElevenLabs and cannot be set
-from the initiation payload.
+Retell also supplies built-ins we don't have to mint — `{{current_time}}`,
+`{{call_id}}`, `{{direction}}`, `{{user_number}}` among them. We still set our
+own `{{today_date}}` in the business timezone: the built-in clock variables are
+not guaranteed to be in the zone the clinic books in, and that is precisely the
+bug that puts someone on the wrong day.
+
+All values must be strings — numbers as `"42"`, booleans as `"true"`.
 
 ### Hard rules in the system prompt
 
@@ -850,47 +884,39 @@ from the initiation payload.
 
 ### `scripts/sync-agent.ts`
 
-Idempotent `PATCH` of the agent config via the ElevenLabs API: prompt, first
-message, language, LLM, TTS voice and stability, turn-taking settings, and every
-webhook tool definition with its URL and secret header. Run it after any prompt
-change; diff-check in CI so the deployed agent never drifts from `main`.
+Idempotent update of both Retell objects: `PATCH /update-retell-llm/{llm_id}`
+for the general prompt, model, begin message and the full `general_tools` array
+(each custom function with its URL, headers, timeout and talk-while-waiting
+flag), then `PATCH /update-agent/{agent_id}` for voice, language and
+`webhook_url`. Run it after any prompt change, and after the tunnel URL changes
+— custom function URLs are absolute and stored on Retell's side. Diff-check in
+CI so the deployed agent never drifts from `main`.
 
 ---
 
 ## 11. Channels
 
-### Inbound phone — Twilio native integration
+### Inbound phone
 
-1. Buy a Twilio number.
-2. In the ElevenLabs dashboard → Phone Numbers → add the number with the Twilio
-   Account SID and Auth Token.
-3. Assign the agent to that number for inbound.
+1. Buy a number from Retell, or import an existing Twilio/SIP number.
+2. Bind the agent to that number for the inbound direction. A number routes
+   calls only once an agent is bound to it.
+3. Point the inbound call webhook at `/api/voice/init`.
 
-ElevenLabs rewrites the Twilio voice webhook itself. **We run no media server and
-handle no audio.** Our only phone-path responsibility is `/api/voice/init`.
+**We run no media server and handle no audio.** Our only phone-path
+responsibility is `/api/voice/init`, and even that is optional — it exists so a
+returning caller gets their name back. Without it the agent still answers.
 
 ### Web widget
 
 `src/app/page.tsx` — the client-facing demo page.
 
-```tsx
-const conversation = useConversation({
-  onMessage: (m) => appendTranscript(m),
-  onError:   (e) => setError(e),
-})
-
-async function start() {
-  const { conversationToken } = await fetch("/api/voice/widget-token", {
-    method: "POST",
-  }).then((r) => r.json())
-  await conversation.startSession({ conversationToken, connectionType: "webrtc" })
-}
-```
-
-`POST /api/voice/widget-token` mints a short-lived conversation token server-side
-and attaches the same dynamic variables the phone path gets (with
-`caller_name: "there"`, since the browser has no caller ID). The agent ID and API
-key never reach the browser.
+`POST /api/voice/web-call` calls Retell's `POST /v3/create-web-call` server-side
+and returns the `access_token` to the browser, which joins the call with
+Retell's web SDK. The same dynamic variables the phone path gets are passed at
+creation time as `retell_llm_dynamic_variables` (with `caller_name: "there"`,
+since the browser has no caller ID). The API key and agent id never reach the
+browser, and the token expires on its own (`expires_at`).
 
 The page shows a single "Talk to book an appointment" button, a live transcript,
 and the appointments table updating underneath as the booking lands — the visual
@@ -917,7 +943,7 @@ Booking/
 │   └── migrations/                         incl. raw SQL for btree_gist EXCLUDE
 ├── scripts/
 │   ├── seed.ts                             business config + sample customers
-│   ├── sync-agent.ts                       push agent config to ElevenLabs
+│   ├── sync-agent.ts                       push prompt + tools to Retell
 │   └── google-check.ts                     verify SA access, print busy blocks
 └── src/
     ├── app/
@@ -962,16 +988,16 @@ Booking/
     │   │       ├── auth.ts                 secret-header verification
     │   │       ├── validation.ts           Zod → validation_error
     │   │       └── speech.ts               spoken-time formatting
-    │   ├── agent/
+    │   ├── retell/
     │   │   ├── prompt/system-prompt.ts
-    │   │   ├── prompt/tools.ts             webhook tool definitions
-    │   │   └── elevenlabs-client.ts
+    │   │   ├── prompt/tools.ts             custom function definitions
+    │   │   └── retell-client.ts
     │   └── service-factory.ts              DI — nothing news up a service
     └── lib/
         ├── env.ts                          ONLY file touching process.env
         ├── db.ts                           Prisma singleton
         ├── slot-id.ts                      HMAC opaque slot tokens
-        ├── elevenlabs-webhook-auth.ts      elevenlabs-signature verification
+        ├── retell-webhook-auth.ts          x-retell-signature verification
         ├── time.ts                         IANA formatting, spoken times
         ├── phone.ts                        E.164 normalization
         ├── api-response.ts
@@ -999,12 +1025,12 @@ Booking/
 # Database
 DATABASE_URL="postgresql://postgres:postgres@localhost:5432/booking"
 
-# ElevenLabs
-ELEVENLABS_API_KEY="sk_..."
-ELEVENLABS_AGENT_ID="agent_..."
-ELEVENLABS_WEBHOOK_SECRET="wsec_..."      # verifies elevenlabs-signature
+# Retell
+RETELL_API_KEY="key_..."                  # also verifies x-retell-signature
+RETELL_AGENT_ID="agent_..."
+RETELL_LLM_ID="llm_..."
 
-# Our webhook auth — the shared secret ElevenLabs sends on every tool call
+# Our webhook auth — the shared secret Retell sends on every tool call
 VOICE_TOOL_SECRET="<random 32+ chars>"
 
 # Signs slot_id tokens. Must be >= 16 chars. Changing it invalidates
@@ -1038,7 +1064,7 @@ the raw-SQL `btree_gist` exclusion constraint. `lib/env.ts`, `lib/time.ts`,
 **in-memory connector**. The availability engine. Vitest suite over slot
 generation, DST boundaries, and slot-id signing.
 
-*Exit:* `pnpm test` green with no Google account, no ElevenLabs key, no network.
+*Exit:* `pnpm test` green with no Google account, no Retell key, no network.
 
 ### Phase 1 — Google connector
 
@@ -1059,16 +1085,16 @@ test (§15) passes.
 
 ### Phase 3 — Voice on the web
 
-System prompt, tool definitions, `scripts/sync-agent.ts`, `/api/voice/widget-token`,
-and the widget page.
+General prompt, custom function definitions, `scripts/sync-agent.ts`,
+`/api/voice/web-call`, and the widget page.
 
 *Exit:* **first end-to-end voice booking.** Talk into the browser, watch a row
 appear in Postgres and an event appear in Google Calendar.
 
 ### Phase 4 — Phone
 
-Twilio number imported into ElevenLabs, `/api/voice/init` with caller lookup,
-`/api/voice/post-call` with HMAC verification and transcript storage.
+Number bound to the agent in Retell, `/api/voice/init` with caller lookup,
+`/api/voice/post-call` with signature verification and transcript storage.
 
 *Exit:* phone the number, book by voice, read the transcript afterwards.
 
@@ -1111,6 +1137,8 @@ Covers:
   at the correct wall-clock time. The bug this catches is the classic one.
 - **Slot-id signing** — tampered payload rejected, wrong secret rejected, past
   slot rejected, valid round trip.
+- **Webhook signatures** — a body signed with the wrong key rejected, a replayed
+  stale timestamp rejected, a valid signature accepted.
 - **Connector conformance** — one shared suite (`calendar-port.contract.test.ts`)
   run against every connector: create → read busy → update → delete, plus
   double-create with the same `idempotencyKey` yielding exactly one event.
@@ -1162,9 +1190,9 @@ cloudflared tunnel --url http://localhost:3000
 pnpm tsx scripts/sync-agent.ts
 ```
 
-Call the Twilio number. Verify: the greeting uses your name if you've booked
-before, availability is real, the booking lands, and the post-call webhook stored
-a transcript and summary on the `Conversation` row.
+Call the number bound to the agent. Verify: the greeting uses your name if
+you've booked before, availability is real, the booking lands, and the post-call
+webhook stored a transcript and summary on the `Conversation` row.
 
 ### The connector-swap demo
 
