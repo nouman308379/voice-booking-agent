@@ -98,7 +98,9 @@ Two Retell calls on the first message, one on every message after — pass the
 |---|---|
 | `src/services/retell/retell-client.ts` | The only file that knows Retell's wire format |
 | `src/app/api/chat/route.ts` | The HTTP surface |
-| `scripts/create-agent.ts` | One-shot setup: creates the LLM + chat agent |
+| `scripts/create-agent.ts` | One-shot setup: creates the LLM + both agents |
+| `src/app/api/voice/web-call/route.ts` | Mints a browser voice-call token |
+| `src/app/page.tsx` + `_components/` | Mode picker, chat panel, voice panel |
 
 ### Running it
 
@@ -106,10 +108,11 @@ Two Retell calls on the first message, one on every message after — pass the
 # 1. Put your key in .env
 RETELL_API_KEY="key_..."
 
-# 2. Create the LLM + chat agent — prints the id
-pnpm tsx scripts/create-agent.ts
-#   ✓ llm          llm_abc123  (claude-5-sonnet)
-#   ✓ chat agent   agent_xyz789
+# 2. Create the LLM + both agents — prints both ids
+pnpm create-agent
+#   ✓ llm           llm_abc123  (claude-5-sonnet)
+#   ✓ chat agent    agent_xyz789
+#   ✓ voice agent   agent_pqr456
 
 # 3. Paste RETELL_AGENT_ID into .env, then talk to it
 curl -X POST localhost:3000/api/chat \
@@ -171,9 +174,9 @@ Retell at all.
 
 ---
 
-## 4. The voice paths  **[NOT BUILT]**
+## 4. The voice paths
 
-### Web call
+### Web call  **[BUILT — browser-untested]**
 
 ```
 browser          our server                  Retell
@@ -197,7 +200,32 @@ agent management are flat paths off the base URL. Easy to get wrong.
 The API key never reaches the browser — only the short-lived `access_token`,
 which carries its own `expires_at`.
 
-### Inbound phone
+#### Which browser class to use — this one bites
+
+`retell-client-js-sdk` v3 exports two ways in, and they have different security
+models:
+
+| Class | Auth | Status |
+|---|---|---|
+| `RetellClient` | needs a **key in the browser**; calls `create-web-call` itself | current |
+| `RetellWebClient` | takes a **server-minted `accessToken`** | **deprecated, removed in 4.0** |
+
+We use `RetellWebClient`, because it is the only one that accepts a token
+minted server-side and so keeps `RETELL_API_KEY` off the client. The published
+docs show the `RetellClient` form with a *public* key — a different, also-valid
+model, which would need a public key from the dashboard.
+
+When 4.0 lands, either obtain a Retell public key and move to `RetellClient`,
+or check whether a token-consuming path has returned to the supported API.
+
+#### Transcript events
+
+`client.on("update", …)` fires with the **entire transcript each time**, not a
+delta. Replace state, don't append, or every line duplicates. The other events
+worth binding: `call_started`, `call_ended`, `agent_start_talking`,
+`agent_stop_talking`, `error`.
+
+### Inbound phone  **[NOT BUILT]**
 
 1. Buy a number from Retell, or import an existing Twilio/SIP number.
 2. Bind the agent to that number for the inbound direction. **A number routes
@@ -341,7 +369,8 @@ persisted and any unconsumed slot hold gets released.
 | Variable | Needed for | Notes |
 |---|---|---|
 | `RETELL_API_KEY` | everything | Also verifies `x-retell-signature`. Server-only. |
-| `RETELL_AGENT_ID` | every conversation | Printed by `scripts/create-agent.ts` |
+| `RETELL_AGENT_ID` | chat | The **chat** agent. Printed by `pnpm create-agent` |
+| `RETELL_VOICE_AGENT_ID` | voice | The **voice** agent, a separate object |
 | `RETELL_BASE_URL` | — | Defaults to `https://api.retellai.com` |
 | `VOICE_TOOL_SECRET` | custom functions | Shared secret Retell sends back on every tool call |
 | `PUBLIC_BASE_URL` | custom functions, webhooks | Must be publicly reachable — a tunnel in dev, not localhost |

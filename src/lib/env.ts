@@ -22,8 +22,14 @@ const schema = z.object({
 
   // ── Retell ────────────────────────────────────────────────────────────
   RETELL_API_KEY: z.string().optional(),
-  /** Printed by `pnpm tsx scripts/create-agent.ts`. */
+  /**
+   * Printed by `pnpm create-agent`. Chat and voice are separate agent objects
+   * in Retell, each with its own id, though both share one Retell LLM.
+   */
   RETELL_AGENT_ID: z.string().optional(),
+  RETELL_VOICE_AGENT_ID: z.string().optional(),
+  /** Set this and `pnpm create-agent` updates the prompt in place. */
+  RETELL_LLM_ID: z.string().optional(),
   RETELL_BASE_URL: z.string().default("https://api.retellai.com"),
 
   PUBLIC_BASE_URL: z.string().default("http://localhost:3000"),

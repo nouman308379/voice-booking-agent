@@ -32,7 +32,10 @@ conversation but cannot see or write a calendar, and its prompt says so.
 
 ```
 src/app/
+  page.tsx                 mode picker — Chat or Voice
+  _components/             chat panel, voice panel
   api/chat/route.ts        POST a message, get the agent's reply
+  api/voice/web-call/      mints a browser voice-call token
 src/lib/
   env.ts        the only file that reads process.env, Zod-validated at boot
   constants.ts  enum-like strings and tunables
@@ -42,7 +45,7 @@ src/lib/
 src/services/retell/
   retell-client.ts         the only file that knows Retell's wire format
 scripts/
-  create-agent.ts          run once — creates the LLM + chat agent, prints the id
+  create-agent.ts          run once — creates the LLM + both agents, prints the ids
 ```
 
 `slot-id.ts` is worth a look — it's the mechanism that stops the language model
@@ -52,7 +55,7 @@ inventing an appointment slot it was never offered.
 
 ```bash
 # one-time: put RETELL_API_KEY in .env, then
-pnpm tsx scripts/create-agent.ts     # prints RETELL_AGENT_ID → paste into .env
+pnpm create-agent     # prints both agent ids → paste into .env
 
 curl -X POST localhost:3000/api/chat \
   -H 'content-type: application/json' \

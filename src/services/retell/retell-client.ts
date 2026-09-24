@@ -24,14 +24,18 @@ export interface RetellMessage {
   content?: string
 }
 
-async function retell<T>(path: string, body: unknown): Promise<T> {
+async function retell<T>(
+  path: string,
+  body: unknown,
+  method: "POST" | "PATCH" = "POST",
+): Promise<T> {
   const apiKey = env.RETELL_API_KEY
   if (!apiKey) throw new RetellError("RETELL_API_KEY is not set")
 
   let res: Response
   try {
     res = await fetch(`${env.RETELL_BASE_URL}${path}`, {
-      method: "POST",
+      method,
       headers: {
         authorization: `Bearer ${apiKey}`,
         "content-type": "application/json",
@@ -52,12 +56,30 @@ async function retell<T>(path: string, body: unknown): Promise<T> {
 
 // ── Agent setup (run once, by scripts/create-agent.ts) ────────────────────
 
-export function createRetellLlm(input: {
+/** Built-in Retell tools need no URL — the platform implements them. */
+export type GeneralTool = { type: string; name: string; description: string }
+
+export interface LlmConfig {
   general_prompt: string
   begin_message: string
+  general_tools?: GeneralTool[]
   model?: string
-}): Promise<{ llm_id: string }> {
+}
+
+export function createRetellLlm(input: LlmConfig): Promise<{ llm_id: string }> {
   return retell("/create-retell-llm", { model: RETELL_MODEL, ...input })
+}
+
+/** Patch an existing LLM so agent ids stay stable across prompt changes. */
+export function updateRetellLlm(
+  llmId: string,
+  input: LlmConfig,
+): Promise<{ llm_id: string }> {
+  return retell(
+    `/update-retell-llm/${llmId}`,
+    { model: RETELL_MODEL, ...input },
+    "PATCH",
+  )
 }
 
 /**
@@ -87,6 +109,36 @@ export function createVoiceAgent(input: {
     agent_name: input.agent_name,
     voice_id: input.voice_id,
     language: input.language ?? "en-US",
+  })
+}
+
+// ── Web call (voice in the browser) ───────────────────────────────────────
+
+export interface WebCall {
+  access_token: string
+  call_id: string
+  /**
+   * "gateway" | "livekit". MUST be forwarded to the browser SDK: its default
+   * is "livekit", so dropping this field makes it dial the wrong transport
+   * and fail with a misleading "invalid API key".
+   */
+  transport?: string
+  url?: string
+  ice_servers?: unknown[]
+  /** Unix ms. The token is short-lived by design. */
+  expires_at?: number
+}
+
+/** Note the /v3 prefix — web-call creation is the one versioned endpoint. */
+export function createWebCall(
+  agentId: string,
+  dynamicVariables?: Record<string, string>,
+): Promise<WebCall> {
+  return retell("/v3/create-web-call", {
+    agent_id: agentId,
+    ...(dynamicVariables
+      ? { retell_llm_dynamic_variables: dynamicVariables }
+      : {}),
   })
 }
 
